@@ -9,6 +9,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
@@ -24,13 +25,14 @@ import (
 // DedupClient is a Kubernetes client with a deduplicated cache.
 // It implements sigs.k8s.io/controller-runtime/pkg/client.Client.
 type DedupClient struct {
-	dynamic dynamic.Interface
-	cache   *cache.Cache
-	codec   *codec.Codec
-	store   store.Store
-	scheme  *runtime.Scheme
-	mapper  meta.RESTMapper
-	opts    *options
+	dynamic   dynamic.Interface
+	cache     *cache.Cache
+	clientLRU *cache.LRUCache // per-client LRU (nil if not configured)
+	codec     *codec.Codec
+	scheme    *runtime.Scheme
+	mapper    meta.RESTMapper
+	opts      *options
+	manager   *SharedStoreManager // non-nil if created via SharedStoreManager
 }
 
 // Compile-time interface checks.
@@ -64,18 +66,16 @@ func New(cfg *rest.Config, optFns ...Option) (*DedupClient, error) {
 		mapper = meta.NewDefaultRESTMapper(nil)
 	}
 
-	// Create codec and store.
+	// Create codec.
 	c := codec.NewCodec(opts.scheme)
-	s := store.NewDedupStore()
 
-	// Create the cache.
+	// Create the cache (owns the single DedupStore).
 	cacheInstance := cache.NewCache(dynClient, opts.scheme, opts.namespaces, opts.reconstructLRUSize)
 
 	return &DedupClient{
 		dynamic: dynClient,
 		cache:   cacheInstance,
 		codec:   c,
-		store:   s,
 		scheme:  opts.scheme,
 		mapper:  mapper,
 		opts:    opts,
@@ -85,7 +85,19 @@ func New(cfg *rest.Config, optFns ...Option) (*DedupClient, error) {
 // --- Reader methods (served from cache) ---
 
 // Get retrieves a single object by key from the cache.
+// When a per-client LRU is configured (via SharedStoreManager), it is checked first.
 func (c *DedupClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if c.clientLRU != nil {
+		gvk, err := c.codec.GVKForObject(obj)
+		if err == nil {
+			cacheKey := cache.LRUKey(gvk, key.Namespace, key.Name)
+			if cached, ok := c.clientLRU.Get(cacheKey); ok {
+				if u, ok2 := cached.(*unstructured.Unstructured); ok2 {
+					return c.codec.FromUnstructured(u, obj)
+				}
+			}
+		}
+	}
 	return c.cache.Get(ctx, key, obj)
 }
 
@@ -140,7 +152,11 @@ func (c *DedupClient) Create(ctx context.Context, obj client.Object, opts ...cli
 		if unstrResult, ok2 := result.(client.Object); ok2 {
 			unstrConverted, convErr := c.codec.ToUnstructured(unstrResult)
 			if convErr == nil {
-				_ = c.store.Upsert(storeKey, unstrConverted)
+				_ = c.cache.Store().Upsert(storeKey, unstrConverted)
+				c.cache.InvalidateLRU(gvk, storeKey.Namespace, storeKey.Name)
+				if c.manager != nil {
+					c.manager.InvalidateAllLRUs(gvk, storeKey.Namespace, storeKey.Name)
+				}
 				return c.codec.FromUnstructured(unstrConverted, obj)
 			}
 		}
@@ -182,7 +198,11 @@ func (c *DedupClient) Update(ctx context.Context, obj client.Object, opts ...cli
 				Namespace: unstrConverted.GetNamespace(),
 				Name:      unstrConverted.GetName(),
 			}
-			_ = c.store.Upsert(storeKey, unstrConverted)
+			_ = c.cache.Store().Upsert(storeKey, unstrConverted)
+			c.cache.InvalidateLRU(gvk, storeKey.Namespace, storeKey.Name)
+			if c.manager != nil {
+				c.manager.InvalidateAllLRUs(gvk, storeKey.Namespace, storeKey.Name)
+			}
 			return c.codec.FromUnstructured(unstrConverted, obj)
 		}
 	}
@@ -226,7 +246,11 @@ func (c *DedupClient) Patch(ctx context.Context, obj client.Object, patch client
 				Namespace: unstrConverted.GetNamespace(),
 				Name:      unstrConverted.GetName(),
 			}
-			_ = c.store.Upsert(storeKey, unstrConverted)
+			_ = c.cache.Store().Upsert(storeKey, unstrConverted)
+			c.cache.InvalidateLRU(gvk, storeKey.Namespace, storeKey.Name)
+			if c.manager != nil {
+				c.manager.InvalidateAllLRUs(gvk, storeKey.Namespace, storeKey.Name)
+			}
 			return c.codec.FromUnstructured(unstrConverted, obj)
 		}
 	}
@@ -259,7 +283,11 @@ func (c *DedupClient) Delete(ctx context.Context, obj client.Object, opts ...cli
 		Namespace: obj.GetNamespace(),
 		Name:      obj.GetName(),
 	}
-	_ = c.store.Delete(storeKey)
+	_ = c.cache.Store().Delete(storeKey)
+	c.cache.InvalidateLRU(gvk, storeKey.Namespace, storeKey.Name)
+	if c.manager != nil {
+		c.manager.InvalidateAllLRUs(gvk, storeKey.Namespace, storeKey.Name)
+	}
 
 	return nil
 }
@@ -295,14 +323,18 @@ func (c *DedupClient) DeleteAllOf(ctx context.Context, obj client.Object, opts .
 	if ns != "" {
 		storeOpts = append(storeOpts, store.WithNamespace(ns))
 	}
-	items := c.store.List(gvk, storeOpts...)
+	items := c.cache.Store().List(gvk, storeOpts...)
 	for _, item := range items {
 		storeKey := store.ObjectKey{
 			GVK:       gvk,
 			Namespace: item.GetNamespace(),
 			Name:      item.GetName(),
 		}
-		_ = c.store.Delete(storeKey)
+		_ = c.cache.Store().Delete(storeKey)
+		c.cache.InvalidateLRU(gvk, storeKey.Namespace, storeKey.Name)
+		if c.manager != nil {
+			c.manager.InvalidateAllLRUs(gvk, storeKey.Namespace, storeKey.Name)
+		}
 	}
 
 	return nil
@@ -522,7 +554,11 @@ func (s *subResourceClient) Update(ctx context.Context, obj client.Object, opts 
 				Namespace: unstrConverted.GetNamespace(),
 				Name:      unstrConverted.GetName(),
 			}
-			_ = s.client.store.Upsert(storeKey, unstrConverted)
+			_ = s.client.cache.Store().Upsert(storeKey, unstrConverted)
+			s.client.cache.InvalidateLRU(gvk, storeKey.Namespace, storeKey.Name)
+			if s.client.manager != nil {
+				s.client.manager.InvalidateAllLRUs(gvk, storeKey.Namespace, storeKey.Name)
+			}
 			return s.client.codec.FromUnstructured(unstrConverted, obj)
 		}
 	}
@@ -577,7 +613,11 @@ func (s *subResourceClient) Patch(ctx context.Context, obj client.Object, patch 
 				Namespace: unstrConverted.GetNamespace(),
 				Name:      unstrConverted.GetName(),
 			}
-			_ = s.client.store.Upsert(storeKey, unstrConverted)
+			_ = s.client.cache.Store().Upsert(storeKey, unstrConverted)
+			s.client.cache.InvalidateLRU(gvk, storeKey.Namespace, storeKey.Name)
+			if s.client.manager != nil {
+				s.client.manager.InvalidateAllLRUs(gvk, storeKey.Namespace, storeKey.Name)
+			}
 			return s.client.codec.FromUnstructured(unstrConverted, obj)
 		}
 	}

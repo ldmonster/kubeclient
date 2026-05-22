@@ -68,6 +68,23 @@ func lruKey(gvk schema.GroupVersionKind, namespace, name string) string {
 	return fmt.Sprintf("%s/%s/%s/%s/%s", gvk.Group, gvk.Version, gvk.Kind, namespace, name)
 }
 
+// LRUKey builds the LRU cache key for an object (exported for SharedStoreManager).
+func LRUKey(gvk schema.GroupVersionKind, namespace, name string) string {
+	return lruKey(gvk, namespace, name)
+}
+
+// Store returns the underlying DedupStore for direct access.
+func (c *Cache) Store() store.Store {
+	return c.store
+}
+
+// InvalidateLRU removes the LRU entry for the given object key (if LRU is enabled).
+func (c *Cache) InvalidateLRU(gvk schema.GroupVersionKind, namespace, name string) {
+	if c.reconstructLRU != nil {
+		c.reconstructLRU.delete(lruKey(gvk, namespace, name))
+	}
+}
+
 // Get retrieves a single object by key from the cache.
 // The GVK is determined from the `obj` type using the scheme.
 // Returns an error if the object is not found or the GVK cannot be determined.

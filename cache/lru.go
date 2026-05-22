@@ -19,7 +19,7 @@ type lruEntry struct {
 // lruCache is a thread-safe fixed-capacity LRU cache.
 // The key is a string (e.g. "group/version/kind/namespace/name").
 // The value is an arbitrary interface{} (typically *unstructured.Unstructured).
-type lruCache struct {
+type lruCache struct { //nolint:unused
 	mu       sync.Mutex
 	capacity int
 	items    map[string]*lruEntry
@@ -102,4 +102,22 @@ func (c *lruCache) len() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return len(c.items)
+}
+
+// LRUCache is a thread-safe fixed-capacity LRU cache (exported for per-client use).
+type LRUCache = lruCache
+
+// NewLRUCache creates a new LRUCache with the given capacity.
+func NewLRUCache(capacity int) *LRUCache {
+	return newLRUCache(capacity)
+}
+
+// Delete removes the entry for key from the cache (exported).
+func (c *lruCache) Delete(key string) {
+	c.delete(key)
+}
+
+// Get returns the cached value for key and true, or nil and false on a miss (exported).
+func (c *lruCache) Get(key string) (interface{}, bool) {
+	return c.get(key)
 }
